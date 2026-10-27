@@ -65,7 +65,7 @@ async def judge(model, q, a, b):
     try: return bool(json.loads(r.choices[0].message.content).get("same"))
     except Exception: return False
 
-def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY):
+def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY, policy="newest"):
     """Seconds from question end to the first answer on screen, for both paths, given measured calls.
     calls: {"full": call on the whole question, i: call launched at word i}.
     The speculative path shows the latest answer that is ready by the soft pause; if none is ready, it shows
@@ -73,6 +73,8 @@ def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY):
     The replay knows where each question truly ends; a live system does not. So every pause inside the question
     that is long enough to trigger a policy, with an answer on screen before the speaker resumes, counts as a
     premature answer for that policy.
+    policy "newest" shows only the answer to the newest question text, waiting for it to stream if needed.
+    policy "any" (ablation) shows whatever answer is ready first, even one written from an older, shorter version.
     Returns (baseline, speculative, word index used, baseline premature, speculative premature)."""
     words, end = q["words"], q["end"]
     ttft_full = calls["full"]["ttft"]
@@ -85,15 +87,20 @@ def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY):
         if pause_start + endpoint + ttft_full < resume:
             base_pre = True
         if resume - pause_start >= soft:
-            ready = [i for i in pts if i <= k and launch[i] + calls[i]["ttft"] < resume]
-            if ready or pause_start + soft + ttft_full < resume:
+            so_far = [i for i in pts if i <= k]
+            if policy == "newest":
+                ready = so_far and launch[so_far[-1]] + calls[so_far[-1]]["ttft"] < resume
+            else:
+                ready = any(launch[i] + calls[i]["ttft"] < resume for i in so_far)
+            if ready or (not so_far and pause_start + soft + ttft_full < resume):
                 spec_pre = True
     show = end + soft
     if not pts:                                       # nothing looked complete: ask at the soft pause
         return base, min(soft + ttft_full, base), None, base_pre, spec_pre
-    ready = [i for i in pts if launch[i] + calls[i]["ttft"] <= show]
-    if ready:
-        return base, soft, ready[-1], base_pre, spec_pre
+    if policy == "any":
+        ready = [i for i in pts if launch[i] + calls[i]["ttft"] <= show]
+        if ready:
+            return base, soft, ready[-1], base_pre, spec_pre
     i = pts[-1]
     spec = max(show, launch[i] + calls[i]["ttft"]) - end
     # The speculative copilot also has the final transcript at the endpoint, so it can always fire there too;
@@ -124,11 +131,12 @@ async def run(n, model, judge_model, seed, workers):
     for q in qs:
         key = f"{model}|{q['meeting']}|{q['speaker']}|{q['end']:.2f}"; rec = calls[key]
         c = {"full": rec["full"], **{int(k): v for k, v in rec.items() if k.isdigit()}}
-        base, spec, used, bpre, spre = timeline(q, c)
-        early = used is not None and used != len(q["words"]) - 1
-        if early and f"same{used}" not in rec:
-            todo.append((key, used, q))
-        rows.append((key, q, base, spec, used, early, bpre, spre))
+        for pol in ("newest", "any"):
+            base, spec, used, bpre, spre = timeline(q, c, policy=pol)
+            early = used is not None and used != len(q["words"]) - 1
+            if early and f"same{used}" not in rec and (key, used) not in {(t[0], t[1]) for t in todo}:
+                todo.append((key, used, q))
+            rows.append((pol, key, q, base, spec, used, early, bpre, spre))
     async def check(key, used, q):                    # judge only answers actually shown before the full question
         async with sem:
             rec = calls[key]; words = " ".join(t for _, _, t in q["words"])
@@ -137,7 +145,8 @@ async def run(n, model, judge_model, seed, workers):
 
     # Judge controls: identical answers must read as the same, an answer to a different question must not.
     # Without these, a lenient judge would make every early answer look fine.
-    keys = [k for k, *_ in rows]
+    main = [r[1:] for r in rows if r[0] == "newest"]
+    keys = [k for k, *_ in main]
     rnd = random.Random(seed + 1)
     async def control(i, key, q):
         rec = calls[key]
@@ -148,7 +157,7 @@ async def run(n, model, judge_model, seed, workers):
             words = " ".join(t for _, _, t in q["words"])
             rec["ctl_pos"] = await judge(judge_model, words, rec["full"]["text"], rec["full"]["text"])
             rec["ctl_neg"] = await judge(judge_model, words, other, rec["full"]["text"])
-    await asyncio.gather(*(control(i, k, q) for i, (k, q, *_) in enumerate(rows[:100])))
+    await asyncio.gather(*(control(i, k, q) for i, (k, q, *_) in enumerate(main[:100])))
 
     # Vague questions ("what do you think?") make any two answers look alike, so flag them.
     async def vague(key, q):
@@ -157,14 +166,14 @@ async def run(n, model, judge_model, seed, workers):
             return
         async with sem:
             rec["vague"] = await vague_check(judge_model, " ".join(t for _, _, t in q["words"]))
-    await asyncio.gather(*(vague(k, q) for k, q, *_ in rows))
+    await asyncio.gather(*(vague(k, q) for k, q, *_ in main))
 
     # Sensitivity: the endpoint silence and transcription delay are assumptions, so sweep them.
     sweep = []
     for endpoint in (0.5, 0.8, 1.0):
         for stt in (0.3, 0.6):
             sub, need = [], []
-            for key, q, *_ in rows:
+            for key, q, *_ in main:
                 rec = calls[key]
                 c = {"full": rec["full"], **{int(k): v for k, v in rec.items() if k.isdigit()}}
                 b, sp, u, bp, spp = timeline(q, c, endpoint=endpoint, stt=stt)
@@ -174,11 +183,12 @@ async def run(n, model, judge_model, seed, workers):
             await asyncio.gather(*(check(*t) for t in need))
             sweep.append((endpoint, stt, [(b, sp, e, calls[k].get(f"same{u}", True) if e else True, bp, spp) for k, b, sp, u, e, bp, spp in sub]))
     cache.write_text(json.dumps(calls))
-    out = [{"base": b, "spec": sp, "early": e, "same": calls[k].get(f"same{u}", True) if e else True,
-            "extra": len(launch_points(q)), "vague": calls[k].get("vague", False), "base_pre": bp, "spec_pre": spp}
-           for k, q, b, sp, u, e, bp, spp in rows]
-    ctl = [(calls[k]["ctl_pos"], calls[k]["ctl_neg"]) for k, *_ in rows if "ctl_pos" in calls[k]]
-    return out, ctl, sweep
+    def pack(pol):
+        return [{"base": b, "spec": sp, "early": e, "same": calls[k].get(f"same{u}", True) if e else True,
+                 "extra": len(launch_points(q)), "vague": calls[k].get("vague", False), "base_pre": bp, "spec_pre": spp}
+                for p_, k, q, b, sp, u, e, bp, spp in rows if p_ == pol]
+    ctl = [(calls[k]["ctl_pos"], calls[k]["ctl_neg"]) for k, *_ in main if "ctl_pos" in calls[k]]
+    return pack("newest"), ctl, sweep, pack("any")
 
 async def vague_check(model, q):
     r = await _client.chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
@@ -190,7 +200,7 @@ VAGUE = ('A person in a meeting asked: "{q}"\nIs this a vague or open-ended ques
          'or "any ideas?") where many different answers would be equally acceptable? Reply as JSON: {{"vague": true or false}}')
 
 def report(result, model, judge_model):
-    rows, ctl, sweep = result
+    rows, ctl, sweep, any_rows = result
     p = lambda v, x: sorted(v)[min(len(v) - 1, int(x * len(v)))]
     med = statistics.median
     b = [r["base"] for r in rows]; s = [r["spec"] for r in rows]
@@ -206,11 +216,17 @@ def report(result, model, judge_model):
           f"Main setting: transcription delay {STT_DELAY*1000:.0f} ms (Cluely's quoted figure), endpoint silence {ENDPOINT*1000:.0f} ms, soft pause {SOFT*1000:.0f} ms.", "",
           "| Question end to first answer on screen | p50 | p90 |", "|---|---|---|",
           f"| Baseline: wait for endpoint silence, then ask | {med(b):.2f} s | {p(b, .9):.2f} s |",
-          f"| Speculative: start answers while the question is still being asked | {med(s):.2f} s | {p(s, .9):.2f} s |", "",
+          f"| Speculative: start answers while the question is still being asked, show the newest | {med(s):.2f} s | {p(s, .9):.2f} s |",
+          f"| Ablation: same, but show any ready answer, even to an older version of the question | {med([r['spec'] for r in any_rows]):.2f} s | {p([r['spec'] for r in any_rows], .9):.2f} s |", "",
           f"**Median wait cut from {med(b):.2f} s to {med(s):.2f} s, {med(b)/max(med(s),1e-9):.1f}x faster.**", "",
           f"Premature answers, shown during a pause before the speaker finished the question: baseline {100*sum(r['base_pre'] for r in rows)/len(rows):.0f}% of questions, "
           f"speculative {100*sum(r['spec_pre'] for r in rows)/len(rows):.0f}%. This is the price of answering on shorter pauses.", "",
           "## Answer quality", "",
+          (lambda e, ok, e2, ok2: f"Early answers, shown before the newest full-question answer existed: main rule {e2} of {len(rows)}, "
+                                  f"{ok2} ({100*ok2/max(e2,1):.0f}%) rated as useful as the full-question answer. "
+                                  f"Ablation rule {e} of {len(any_rows)}, {ok} ({100*ok/max(e,1):.0f}%) rated as useful.")(
+              sum(r["early"] for r in any_rows), sum(r["early"] and r["same"] for r in any_rows),
+              sum(r["early"] for r in rows), sum(r["early"] and r["same"] for r in rows)), "",
           f"Answers shown before the full question was transcribed: {n_e} of {len(rows)}. "
           + (f"The judge rated {ok} ({100*ok/n_e:.0f}%) as useful as the full-question answer; the rest would be revised on screen." if n_e else ""),
           f"On the {len(spec_rows)} specific questions (excluding {len(rows)-len(spec_rows)} the judge flagged as vague, like \"what do you think?\"): "

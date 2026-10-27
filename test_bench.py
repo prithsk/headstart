@@ -54,8 +54,11 @@ assert bench.launch_points(q)[-1] == len(words) - 1
 calls = {"full": {"ttft": 0.6, "text": "x"}, **{i: {"ttft": 0.6, "text": "x"} for i in bench.launch_points(q)}}
 base, spec, used, _, _ = bench.timeline(q, calls)
 assert abs(base - (0.8 + 0.6)) < 1e-9, base
-# The early launch at word 4 ("settle", ends 13.0) is ready at 13.0 + 0.3 + 0.6 = 13.9 <= 13.7 + 0.25? No: 13.9 > 13.95 is false, so it is ready.
-assert used == 4 and abs(spec - 0.25) < 1e-9, (spec, used)
+# Newest rule: wait for the answer to the full question (launched at the last word + 300 ms).
+assert used == len(words) - 1 and abs(spec - (0.30 + 0.6)) < 1e-9, (spec, used)
+# Ablation rule: the answer started at word 4 ("settle") is already ready, so it shows at the soft pause.
+_, spec_a, used_a, _, _ = bench.timeline(q, calls, policy="any")
+assert used_a == 4 and abs(spec_a - 0.25) < 1e-9, (spec_a, used_a)
 slow = {"full": {"ttft": 2.0, "text": "x"}, **{i: {"ttft": 2.0, "text": "x"} for i in bench.launch_points(q)}}
 b2, s2, u2, _, _ = bench.timeline(q, slow)                                          # nothing ready in time: latest launch streams
 assert u2 == len(words) - 1 and abs(s2 - (0.30 + 2.0)) < 1e-9 and abs(b2 - 2.8) < 1e-9, (s2, b2)
@@ -84,14 +87,15 @@ async def fake_vague(model, q):
     return "think" in q
 bench.ask, bench.judge, bench.vague_check, bench.ROOT = fake_ask, fake_judge, fake_vague, tmp
 import os; os.environ["OPENAI_API_KEY"] = "test"
-rows, ctl, sweep = asyncio.run(bench.run(5, "fake", "fake", 1, 2))
+rows, ctl, sweep, any_rows = asyncio.run(bench.run(5, "fake", "fake", 1, 2))
 assert "spec_pre" in rows[0] and len(sweep[0][2][0]) == 6
-assert len(rows) == 1 and rows[0]["spec"] < rows[0]["base"] and rows[0]["early"] and rows[0]["same"], rows
+assert len(rows) == 1 and rows[0]["spec"] < rows[0]["base"] and not rows[0]["early"], rows
+assert any_rows[0]["early"] and any_rows[0]["same"] and any_rows[0]["spec"] < rows[0]["spec"], any_rows
 assert ctl == [(True, False)] or ctl == [(True, True)], ctl          # one question: identical pair passes the control
 assert len(sweep) == 6 and all(len(sub) == 1 for _, _, sub in sweep)
 rec = json.load(open(tmp / "results" / "calls.json")).popitem()[1]
 assert rec["ctl_pos"] is True and "vague" in rec and any(k.startswith("same") for k in rec), rec.keys()
-bench.report((rows, ctl, sweep), "fake", "fake")
+bench.report((rows, ctl, sweep, any_rows), "fake", "fake")
 txt = sorted((tmp / "results").glob("2*.md"))[-1].read_text()
 assert "Judge controls" in txt and "Sensitivity to the assumptions" in txt and "Premature answers" in txt and "| 500 ms | 300 ms |" in txt
 
