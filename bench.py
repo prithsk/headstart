@@ -68,23 +68,37 @@ async def judge(model, q, a, b):
 def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY):
     """Seconds from question end to the first answer on screen, for both paths, given measured calls.
     calls: {"full": call on the whole question, i: call launched at word i}.
-    The speculative path shows the latest answer that is ready by the soft pause; if none is ready,
-    it shows the latest launch as soon as it streams. Returns (baseline, speculative, word index used)."""
+    The speculative path shows the latest answer that is ready by the soft pause; if none is ready, it shows
+    whichever comes first, the latest launch or the endpoint answer.
+    The replay knows where each question truly ends; a live system does not. So every pause inside the question
+    that is long enough to trigger a policy, with an answer on screen before the speaker resumes, counts as a
+    premature answer for that policy.
+    Returns (baseline, speculative, word index used, baseline premature, speculative premature)."""
     words, end = q["words"], q["end"]
-    base = endpoint + calls["full"]["ttft"]
+    ttft_full = calls["full"]["ttft"]
+    base = endpoint + ttft_full
     pts = [i for i in launch_points(q) if i in calls]
+    launch = {i: words[i][1] + stt for i in pts}
+    base_pre = spec_pre = False
+    for k in range(len(words) - 1):
+        pause_start, resume = words[k][1], words[k + 1][0]
+        if pause_start + endpoint + ttft_full < resume:
+            base_pre = True
+        if resume - pause_start >= soft:
+            ready = [i for i in pts if i <= k and launch[i] + calls[i]["ttft"] < resume]
+            if ready or pause_start + soft + ttft_full < resume:
+                spec_pre = True
     show = end + soft
     if not pts:                                       # nothing looked complete: ask at the soft pause
-        return base, soft + calls["full"]["ttft"], None
-    launch = {i: words[i][1] + stt for i in pts}      # a word reaches the copilot after the transcription delay
+        return base, min(soft + ttft_full, base), None, base_pre, spec_pre
     ready = [i for i in pts if launch[i] + calls[i]["ttft"] <= show]
     if ready:
-        return base, soft, ready[-1]
+        return base, soft, ready[-1], base_pre, spec_pre
     i = pts[-1]
     spec = max(show, launch[i] + calls[i]["ttft"]) - end
     # The speculative copilot also has the final transcript at the endpoint, so it can always fire there too;
     # it shows whichever answer is ready first and is never slower than the baseline.
-    return base, min(spec, base), i if spec <= base else len(words) - 1
+    return base, min(spec, base), (i if spec <= base else len(words) - 1), base_pre, spec_pre
 
 async def run(n, model, judge_model, seed, workers):
     load_env()
@@ -110,11 +124,11 @@ async def run(n, model, judge_model, seed, workers):
     for q in qs:
         key = f"{model}|{q['meeting']}|{q['speaker']}|{q['end']:.2f}"; rec = calls[key]
         c = {"full": rec["full"], **{int(k): v for k, v in rec.items() if k.isdigit()}}
-        base, spec, used = timeline(q, c)
+        base, spec, used, bpre, spre = timeline(q, c)
         early = used is not None and used != len(q["words"]) - 1
         if early and f"same{used}" not in rec:
             todo.append((key, used, q))
-        rows.append((key, q, base, spec, used, early))
+        rows.append((key, q, base, spec, used, early, bpre, spre))
     async def check(key, used, q):                    # judge only answers actually shown before the full question
         async with sem:
             rec = calls[key]; words = " ".join(t for _, _, t in q["words"])
@@ -153,15 +167,16 @@ async def run(n, model, judge_model, seed, workers):
             for key, q, *_ in rows:
                 rec = calls[key]
                 c = {"full": rec["full"], **{int(k): v for k, v in rec.items() if k.isdigit()}}
-                b, sp, u = timeline(q, c, endpoint=endpoint, stt=stt)
+                b, sp, u, bp, spp = timeline(q, c, endpoint=endpoint, stt=stt)
                 e = u is not None and u != len(q["words"]) - 1
                 if e and f"same{u}" not in rec: need.append((key, u, q))
-                sub.append((key, b, sp, u, e))
+                sub.append((key, b, sp, u, e, bp, spp))
             await asyncio.gather(*(check(*t) for t in need))
-            sweep.append((endpoint, stt, [(b, sp, e, calls[k].get(f"same{u}", True) if e else True) for k, b, sp, u, e in sub]))
+            sweep.append((endpoint, stt, [(b, sp, e, calls[k].get(f"same{u}", True) if e else True, bp, spp) for k, b, sp, u, e, bp, spp in sub]))
     cache.write_text(json.dumps(calls))
     out = [{"base": b, "spec": sp, "early": e, "same": calls[k].get(f"same{u}", True) if e else True,
-            "extra": len(launch_points(q)), "vague": calls[k].get("vague", False)} for k, q, b, sp, u, e in rows]
+            "extra": len(launch_points(q)), "vague": calls[k].get("vague", False), "base_pre": bp, "spec_pre": spp}
+           for k, q, b, sp, u, e, bp, spp in rows]
     ctl = [(calls[k]["ctl_pos"], calls[k]["ctl_neg"]) for k, *_ in rows if "ctl_pos" in calls[k]]
     return out, ctl, sweep
 
@@ -193,6 +208,8 @@ def report(result, model, judge_model):
           f"| Baseline: wait for endpoint silence, then ask | {med(b):.2f} s | {p(b, .9):.2f} s |",
           f"| Speculative: start answers while the question is still being asked | {med(s):.2f} s | {p(s, .9):.2f} s |", "",
           f"**Median wait cut from {med(b):.2f} s to {med(s):.2f} s, {med(b)/max(med(s),1e-9):.1f}x faster.**", "",
+          f"Premature answers, shown during a pause before the speaker finished the question: baseline {100*sum(r['base_pre'] for r in rows)/len(rows):.0f}% of questions, "
+          f"speculative {100*sum(r['spec_pre'] for r in rows)/len(rows):.0f}%. This is the price of answering on shorter pauses.", "",
           "## Answer quality", "",
           f"Answers shown before the full question was transcribed: {n_e} of {len(rows)}. "
           + (f"The judge rated {ok} ({100*ok/n_e:.0f}%) as useful as the full-question answer; the rest would be revised on screen." if n_e else ""),
@@ -203,11 +220,12 @@ def report(result, model, judge_model):
           + (" **The mismatched rate is high enough that the quality numbers above should not be trusted.**" if ctl and neg / len(ctl) > 0.15 else ""),
           f"Model calls per question: {1 + statistics.mean(r['extra'] for r in rows):.1f} on average, against 1 for the baseline.", "",
           "## Sensitivity to the assumptions", "",
-          "| Endpoint silence | Transcription delay | Baseline p50 | Speculative p50 | Speedup | Early answers rated as useful |", "|---|---|---|---|---|---|"]
+          "| Endpoint silence | Transcription delay | Baseline p50 | Speculative p50 | Speedup | Early answers rated as useful | Premature, baseline / speculative |", "|---|---|---|---|---|---|---|"]
     for endpoint, stt, sub in sweep:
         bb = [x[0] for x in sub]; ss = [x[1] for x in sub]; ee = [x for x in sub if x[2]]
         q = f"{100*sum(x[3] for x in ee)/len(ee):.0f}% of {len(ee)}" if ee else "none early"
-        md.append(f"| {endpoint*1000:.0f} ms | {stt*1000:.0f} ms | {med(bb):.2f} s | {med(ss):.2f} s | {med(bb)/max(med(ss),1e-9):.1f}x | {q} |")
+        pb = 100 * sum(x[4] for x in sub) / len(sub); ps = 100 * sum(x[5] for x in sub) / len(sub)
+        md.append(f"| {endpoint*1000:.0f} ms | {stt*1000:.0f} ms | {med(bb):.2f} s | {med(ss):.2f} s | {med(bb)/max(med(ss),1e-9):.1f}x | {q} | {pb:.0f}% / {ps:.0f}% |")
     md += ["", "## Honest limits", "",
            "- This compares two policies under the same assumptions. It does not measure Cluely's product; CALIBRATE.md describes how to time Cluely itself on the same questions.",
            "- Word timings come from forced alignment of headset audio, and transcription delay is modeled as fixed, so this assumes a good streaming transcriber in a quiet room.",

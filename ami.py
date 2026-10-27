@@ -57,7 +57,7 @@ def read_questions(dact_bytes, tokens, qtypes):
     pos = {t[0]: i for i, t in enumerate(tokens)}
     out = []
     for dact in ET.fromstring(dact_bytes):
-        ptr = dact.find(NITE + "pointer"); child = dact.find(NITE + "child")
+        ptr = next((x for x in dact.findall(NITE + "pointer") if x.get("role") == "da-aspect"), None); child = dact.find(NITE + "child")
         if ptr is None or child is None:
             continue
         m = re.search(r"#id\(([^)]+)\)", ptr.get("href", ""))
@@ -85,7 +85,10 @@ def load(max_meetings=None, context_s=90.0):
         if m:
             by_meeting[m.group(1)][m.group(2)] = n
     questions = []
-    for meeting in sorted(by_meeting)[:max_meetings]:
+    # Only some meetings have dialogue-act annotations (the EN2001 meetings have none), so skip the rest.
+    annotated = {re.search(r"dialogueActs/([A-Z]{2}\d{4}[a-d]?)\.", n).group(1) for n in names
+                 if re.search(r"dialogueActs/[A-Z]{2}\d{4}[a-d]?\.[A-Z]\.dialog-act\.xml$", n)}
+    for meeting in [m for m in sorted(by_meeting) if m in annotated][:max_meetings]:
         timeline, spk_words = [], {}
         for spk, wn in by_meeting[meeting].items():
             toks = read_tokens(z.read(wn)); spk_words[spk] = toks

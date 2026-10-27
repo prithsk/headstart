@@ -32,9 +32,12 @@ _Run it to populate._
 3. **Sensitivity sweep.** Endpoint silence and transcription delay are assumptions, so the report recomputes the result
    for endpoints of 500, 800 and 1000 ms and transcription delays of 300 and 600 ms. Speculation pays off only when
    transcription is fast; the sweep shows how much.
-4. **Never slower than the baseline.** The speculative copilot also fires on the endpoint, so the comparison can only
+4. **Premature answers counted.** The replay knows where each question ends; a live copilot does not. Every pause
+   inside a question long enough to trigger a policy, with an answer on screen before the speaker resumes, counts
+   as a premature answer for that policy, so a shorter pause threshold cannot buy speed for free.
+5. **Never slower than the baseline.** The speculative copilot also fires on the endpoint, so the comparison can only
    show a real gain or a tie.
-5. **Cluely itself.** `clips.py` and [CALIBRATE.md](CALIBRATE.md) time Cluely on the same questions from a screen
+6. **Cluely itself.** `clips.py` and [CALIBRATE.md](CALIBRATE.md) time Cluely on the same questions from a screen
    recording, so the simulation has a real anchor.
 
 ## Data

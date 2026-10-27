@@ -25,6 +25,8 @@ def fake_zip(path):
          ("okay", 14.5, 14.8, 0), ("yeah", 14.8, 15.0, 0), ("sure", 15.0, 15.2, 0), ("fine", 15.2, 15.4, 0)]
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("ontologies/da-types.xml", DA_TYPES)
+        # A meeting with words but no dialogue acts sorts first, like EN2001 in the real corpus.
+        z.writestr("words/EN2001a.A.words.xml", words_xml("EN2001a", "A", [("hello", 1.0, 1.2, 0)]))
         z.writestr("words/ES2002a.A.words.xml", words_xml("ES2002a", "A", a))
         z.writestr("words/ES2002a.B.words.xml", words_xml("ES2002a", "B", b))
         z.writestr("dialogueActs/ES2002a.A.dialog-act.xml", dacts("ES2002a", "A", [("ami_da_1", 0, 5)]))
@@ -36,6 +38,7 @@ tmp = pathlib.Path(tempfile.mkdtemp()); (tmp / "data").mkdir()
 fake_zip(tmp / "data" / "ami_public_manual_1.6.2.zip"); ami.ROOT = tmp
 qs = ami.load()
 assert len(qs) == 1, qs
+assert len(ami.load(max_meetings=1)) == 1, "an unannotated meeting that sorts first must be skipped"
 q = qs[0]
 assert " ".join(t for _, _, t in q["words"]) == "what price did we settle on for the remote", q["words"]
 assert q["end"] == 13.7 and "Speaker A: so we agreed on rubber" in q["context"], q["context"]
@@ -49,17 +52,28 @@ assert bench.launch_points(q)[-1] == len(words) - 1
 
 # 3. Timing model: baseline pays the endpoint; speculative overlaps generation with the rest of the question.
 calls = {"full": {"ttft": 0.6, "text": "x"}, **{i: {"ttft": 0.6, "text": "x"} for i in bench.launch_points(q)}}
-base, spec, used = bench.timeline(q, calls)
+base, spec, used, _, _ = bench.timeline(q, calls)
 assert abs(base - (0.8 + 0.6)) < 1e-9, base
 # The early launch at word 4 ("settle", ends 13.0) is ready at 13.0 + 0.3 + 0.6 = 13.9 <= 13.7 + 0.25? No: 13.9 > 13.95 is false, so it is ready.
 assert used == 4 and abs(spec - 0.25) < 1e-9, (spec, used)
 slow = {"full": {"ttft": 2.0, "text": "x"}, **{i: {"ttft": 2.0, "text": "x"} for i in bench.launch_points(q)}}
-b2, s2, u2 = bench.timeline(q, slow)                                          # nothing ready in time: latest launch streams
+b2, s2, u2, _, _ = bench.timeline(q, slow)                                          # nothing ready in time: latest launch streams
 assert u2 == len(words) - 1 and abs(s2 - (0.30 + 2.0)) < 1e-9 and abs(b2 - 2.8) < 1e-9, (s2, b2)
-b3, s3, _ = bench.timeline(q, slow, endpoint=0.2, stt=0.6)                   # slow transcriber, short endpoint
+b3, s3, _, _, _ = bench.timeline(q, slow, endpoint=0.2, stt=0.6)                   # slow transcriber, short endpoint
 assert abs(s3 - b3) < 1e-9 and abs(b3 - 2.2) < 1e-9, (s3, b3)                # never slower than the baseline
 assert bench.timeline({"words": [(0, 0.2, "okay"), (0.2, 0.4, "so"), (0.4, 0.5, "um"), (0.5, 0.6, "the")], "end": 0.6},
-                      {"full": {"ttft": 0.5, "text": "x"}})[1] == 0.25 + 0.5      # nothing launched: soft pause then ask
+                      {"full": {"ttft": 0.5, "text": "x"}})[1] == 0.25 + 0.5
+# A 0.9 s pause after "what price did we settle" (an answer is ready by then) flags the speculative path only;
+# a 3 s pause there also flags the baseline.
+def paused(gap):
+    ws = [(12.0, 12.2, "what"), (12.2, 12.5, "price"), (12.5, 12.6, "did"), (12.6, 12.7, "we"), (12.7, 13.0, "settle"),
+          (13.0 + gap, 13.1 + gap, "on"), (13.1 + gap, 13.2 + gap, "for"), (13.2 + gap, 13.3 + gap, "the"), (13.3 + gap, 13.7 + gap, "remote")]
+    pq = {"words": ws, "end": ws[-1][1]}
+    c = {"full": {"ttft": 0.5, "text": "x"}, **{i: {"ttft": 0.5, "text": "x"} for i in bench.launch_points(pq)}}
+    return bench.timeline(pq, c)
+assert paused(0.9)[3:] == (False, True), paused(0.9)
+assert paused(3.0)[3:] == (True, True), paused(3.0)
+assert paused(0.0)[3:] == (False, False), paused(0.0)      # nothing launched: soft pause then ask
 
 # 4. End to end with a fake model: calls cached, judge controls run, vague flag set, sweep computed, report written.
 async def fake_ask(model, ctx, qtext):
@@ -71,6 +85,7 @@ async def fake_vague(model, q):
 bench.ask, bench.judge, bench.vague_check, bench.ROOT = fake_ask, fake_judge, fake_vague, tmp
 import os; os.environ["OPENAI_API_KEY"] = "test"
 rows, ctl, sweep = asyncio.run(bench.run(5, "fake", "fake", 1, 2))
+assert "spec_pre" in rows[0] and len(sweep[0][2][0]) == 6
 assert len(rows) == 1 and rows[0]["spec"] < rows[0]["base"] and rows[0]["early"] and rows[0]["same"], rows
 assert ctl == [(True, False)] or ctl == [(True, True)], ctl          # one question: identical pair passes the control
 assert len(sweep) == 6 and all(len(sub) == 1 for _, _, sub in sweep)
@@ -78,7 +93,7 @@ rec = json.load(open(tmp / "results" / "calls.json")).popitem()[1]
 assert rec["ctl_pos"] is True and "vague" in rec and any(k.startswith("same") for k in rec), rec.keys()
 bench.report((rows, ctl, sweep), "fake", "fake")
 txt = sorted((tmp / "results").glob("2*.md"))[-1].read_text()
-assert "Judge controls" in txt and "Sensitivity to the assumptions" in txt and "| 500 ms | 300 ms |" in txt
+assert "Judge controls" in txt and "Sensitivity to the assumptions" in txt and "Premature answers" in txt and "| 500 ms | 300 ms |" in txt
 
 # 5. Clip cutter: the question ends exactly where the CSV says, after the beep and lead-in.
 import wave, struct, clips
