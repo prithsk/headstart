@@ -99,23 +99,49 @@ bench.report((rows, ctl, sweep, any_rows), "fake", "fake")
 txt = sorted((tmp / "results").glob("2*.md"))[-1].read_text()
 assert "Judge controls" in txt and "Sensitivity to the assumptions" in txt and "Premature answers" in txt and "| 500 ms | 300 ms |" in txt
 
-# 5. Clip cutter: the question ends exactly where the CSV says, after the beep and lead-in.
-import wave, struct, clips
+# 5. Clip kit: the cut keeps the question end where the CSV says, playback logs offsets from the sync beep,
+#    and the report turns one sync time plus marked answer times into waits.
+import wave, struct, clips, csv
 rate = 16000; src = io.BytesIO()
 with wave.open(src, "wb") as w:
     w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-    w.writeframes(b"".join(struct.pack("<h", i % 1000) for i in range(rate * 40)))   # 40 s of audio
+    w.writeframes(b"".join(struct.pack("<h", i % 1000) for i in range(rate * 40)))
 dst = tmp / "c.wav"
 qend = clips.cut(src.getvalue(), 25.0, dst)
-assert abs(qend - (clips.BEEP + clips.LEAD)) < 1e-9
+assert abs(qend - clips.LEAD) < 1e-9
 with wave.open(str(dst)) as w:
-    assert abs(w.getnframes() / rate - (clips.BEEP + clips.LEAD + clips.TAIL)) < 0.01
-    w.setpos(int(qend * rate)); first = struct.unpack("<h", w.readframes(1))[0]
-assert first == int(25.0 * rate) % 1000, first                                   # same sample as 25.0 s in the source
-near = clips.cut(src.getvalue(), 5.0, tmp / "n.wav"); assert abs(near - (clips.BEEP + 5.0)) < 1e-9   # short lead near the start
-import csv
-with open(tmp / "t.csv", "w", newline="") as fh:
-    wr = csv.writer(fh); wr.writerow(["clip", "meeting", "question", "question_end_s", "answer_appeared_s"])
-    wr.writerow(["q01.wav", "m", "x", "12.30", "15.30"]); wr.writerow(["q02.wav", "m", "y", "12.30", ""])
-clips.report(tmp / "t.csv")
+    assert abs(w.getnframes() / rate - (clips.LEAD + clips.TAIL)) < 0.01
+    w.setpos(int(qend * rate)); assert struct.unpack("<h", w.readframes(1))[0] == int(25.0 * rate) % 1000
+assert abs(clips.cut(src.getvalue(), 5.0, tmp / "n.wav") - 5.0) < 1e-9          # short lead near the meeting start
+
+clips.ROOT = tmp; clips.CSV = tmp / "clips" / "cluely_times.csv"; (tmp / "clips").mkdir(exist_ok=True)
+clips.tone(tmp / "clips" / "sync.wav")
+for name in ("q01.wav", "q02.wav"): (tmp / "clips" / name).write_bytes((tmp / "c.wav").read_bytes())
+clips.write_rows([{"clip": "q01.wav", "meeting": "ES2002a", "meeting_end_s": "141.98", "question": "a?", "question_end_in_clip_s": "12.00",
+                   "clip_start_after_sync_s": "", "question_end_video_s": "", "answer_video_s": ""},
+                  {"clip": "q02.wav", "meeting": "ES2002a", "meeting_end_s": "200.00", "question": "b?", "question_end_in_clip_s": "12.00",
+                   "clip_start_after_sync_s": "", "question_end_video_s": "", "answer_video_s": ""}])
+now = [0.0]; played = []
+def fake_clock(): return now[0]
+def fake_sleep(s): now[0] += s
+def fake_player(path): played.append(path.name); now[0] += 1.0 if path.name == "sync.wav" else clips.LEAD + clips.TAIL
+clips.play(player=fake_player, clock=fake_clock, sleep=fake_sleep)
+rows = clips.read_rows()
+assert played == ["sync.wav", "q01.wav", "q02.wav"], played
+assert abs(float(rows[0]["clip_start_after_sync_s"]) - (1.0 + clips.GAP / 2)) < 1e-6                       # beep, then half a gap
+assert abs(float(rows[1]["clip_start_after_sync_s"]) - (1.0 + clips.GAP / 2 + clips.LEAD + clips.TAIL + clips.GAP)) < 1e-6
+assert clips.report() is None                                                    # nothing marked yet
+clips.report(sync_video_s=10.0)
+rows = clips.read_rows()
+q1_end = 10.0 + 1.0 + clips.GAP / 2 + 12.0
+assert abs(float(rows[0]["question_end_video_s"]) - q1_end) < 1e-3, rows[0]
+rows[0]["answer_video_s"] = f"{q1_end + 3.2:.3f}"; clips.write_rows(rows)       # Cluely answered 3.2 s after q1 ended; q2 missed
+waits = clips.report()
+assert len(waits) == 1 and abs(waits[0] - 3.2) < 1e-3, waits
+
+# 6. --from-clips runs exactly the listed questions.
+only = {("ES2002a", "13.70")}
+rows6, *_ = asyncio.run(bench.run(5, "fake", "fake", 1, 2, only))
+assert len(rows6) == 1
+assert len(asyncio.run(bench.run(5, "fake", "fake", 1, 2, {("ES2002a", "99.99")}))[0]) == 0
 print("all tests passed")

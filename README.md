@@ -37,8 +37,8 @@ _Run it to populate._
    as a premature answer for that policy, so a shorter pause threshold cannot buy speed for free.
 5. **Never slower than the baseline.** The speculative copilot also fires on the endpoint, so the comparison can only
    show a real gain or a tie.
-6. **Cluely itself.** `clips.py` and [CALIBRATE.md](CALIBRATE.md) time Cluely on the same questions from a screen
-   recording, so the simulation has a real anchor.
+6. **Cluely itself.** `clips.py` and [CALIBRATE.md](CALIBRATE.md) time Cluely on 20 of the same questions from a screen
+   recording, and `bench.py --from-clips` runs headstart on exactly those questions.
 
 ## Data
 
@@ -64,7 +64,7 @@ python -m pip install -r requirements.txt
 python test_bench.py
 python bench.py --inspect       # check that questions parse correctly
 python bench.py --n 200
-python clips.py --n 20          # optional: clips for timing Cluely itself, see CALIBRATE.md
+python clips.py make --n 20     # optional: time Cluely itself on the same questions, see CALIBRATE.md
 ```
 
 Every model call is cached in results/calls.json, so a rerun only does what is missing.

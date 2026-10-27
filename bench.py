@@ -113,11 +113,14 @@ def timeline(q, calls, endpoint=ENDPOINT, soft=SOFT, stt=STT_DELAY, policy="newe
     # it shows whichever answer is ready first and is never slower than the baseline.
     return base, min(spec, base), (i if spec <= base else len(words) - 1), base_pre, spec_pre
 
-async def run(n, model, judge_model, seed, workers):
+async def run(n, model, judge_model, seed, workers, only=None):
     load_env()
     import ami
     qs = ami.load(max_meetings=None)
-    random.Random(seed).shuffle(qs); qs = qs[:n]
+    if only:                                          # exactly the calibration clips' questions
+        qs = [q for q in qs if (q["meeting"], f"{q['end']:.2f}") in only]
+    else:
+        random.Random(seed).shuffle(qs); qs = qs[:n]
     cache = ROOT / "results" / "calls.json"; cache.parent.mkdir(exist_ok=True)
     calls = json.loads(cache.read_text()) if cache.exists() else {}
     sem = asyncio.Semaphore(workers)
@@ -205,7 +208,7 @@ async def vague_check(model, q):
 VAGUE = ('A person in a meeting asked: "{q}"\nIs this a vague or open-ended question (for example "what do you think?" '
          'or "any ideas?") where many different answers would be equally acceptable? Reply as JSON: {{"vague": true or false}}')
 
-def report(result, model, judge_model):
+def report(result, model, judge_model, tag=""):
     rows, ctl, sweep, any_rows = result
     p = lambda v, x: sorted(v)[min(len(v) - 1, int(x * len(v)))]
     med = statistics.median
@@ -255,7 +258,7 @@ def report(result, model, judge_model):
            "- An early answer rated worse is replaced when the full-question answer arrives, so it costs a visible revision, not a wrong final answer.",
            "- Preemptive generation exists in voice-agent frameworks such as LiveKit Agents. The contribution here is measuring it for a meeting copilot on real meeting questions, with an answer-quality check.",
            "- AMI meetings are scripted design meetings with mostly non-native English speakers."]
-    out = "\n".join(md); (ROOT / "results" / f"{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
+    out = "\n".join(md); (ROOT / "results" / f"{tag}{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -263,6 +266,7 @@ if __name__ == "__main__":
     ap.add_argument("--judge", default="gpt-4o-mini"); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--inspect", action="store_true", help="print a few parsed questions and stop, to check the data")
+    ap.add_argument("--from-clips", help="run on exactly the questions listed in a clips.py CSV, for comparison with Cluely")
     a = ap.parse_args()
     if a.inspect:
         import ami
@@ -271,4 +275,8 @@ if __name__ == "__main__":
         for q in qs[:5]:
             print(f"- [{q['meeting']} {q['speaker']} ends {q['end']:.2f}s] {' '.join(t for _, _, t in q['words'])}  | launch at words {launch_points(q)}")
     else:
-        report(asyncio.run(run(a.n, a.model, a.judge, a.seed, a.workers)), a.model, a.judge)
+        only = None
+        if a.from_clips:
+            import csv
+            only = {(r["meeting"], r["meeting_end_s"]) for r in csv.DictReader(open(a.from_clips, newline=""))}
+        report(asyncio.run(run(a.n, a.model, a.judge, a.seed, a.workers, only)), a.model, a.judge, "clips-" if only else "")
