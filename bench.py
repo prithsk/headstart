@@ -41,6 +41,12 @@ PROMPT = ("You are a meeting copilot. Using the recent meeting transcript, give 
           "question just asked, in at most two sentences.\n\nTranscript:\n{ctx}\n\nQuestion just asked: {q}")
 
 _client = None
+def client():
+    """Create the API client on first use, whichever call comes first (all answers may be cached)."""
+    global _client
+    if _client is None:
+        from openai import AsyncOpenAI; _client = AsyncOpenAI(max_retries=6)
+    return _client
 async def ask(model, ctx, qtext):
     """Stream an answer and measure real time to first token."""
     global _client
@@ -60,7 +66,7 @@ JUDGE = ('A person in a meeting asked: "{q}"\nAnswer A: {a}\nAnswer B: {b}\n'
          'Answer B was written from the full question. Is answer A as useful an answer to the full question as B? '
          'Reply as JSON: {{"same": true or false}}')
 async def judge(model, q, a, b):
-    r = await _client.chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
+    r = await client().chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
                                               messages=[{"role": "user", "content": JUDGE.format(q=q, a=a, b=b)}])
     try: return bool(json.loads(r.choices[0].message.content).get("same"))
     except Exception: return False
@@ -191,7 +197,7 @@ async def run(n, model, judge_model, seed, workers):
     return pack("newest"), ctl, sweep, pack("any")
 
 async def vague_check(model, q):
-    r = await _client.chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
+    r = await client().chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
                                               messages=[{"role": "user", "content": VAGUE.format(q=q)}])
     try: return bool(json.loads(r.choices[0].message.content).get("vague"))
     except Exception: return False
